@@ -260,7 +260,7 @@ referencing==0.36.2
     #   jsonschema-specifications
 regex==2025.9.1
     # via readabilipy
-requests==2.32.5
+requests==2.33.0
     # via
     #   aws-requests-auth
     #   bedrock-agentcore-starter-toolkit
