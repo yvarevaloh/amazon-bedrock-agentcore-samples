@@ -1,4 +1,4 @@
-strands-agents[a2a,anthropic]>=1.0.0
+strands-agents[a2a,bedrock]>=1.0.0
 a2a-sdk
 httpx
 boto3

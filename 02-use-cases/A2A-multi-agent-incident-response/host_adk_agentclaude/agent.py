@@ -3,7 +3,7 @@ from a2a.types import TransportProtocol
 from bedrock_agentcore.identity.auth import requires_access_token
 from strands import Agent, tool
 from strands.agent.a2a_agent import A2AAgent
-from strands.models.anthropic import AnthropicModel
+from strands.models.bedrock import BedrockModel
 from prompt import SYSTEM_PROMPT
 from urllib.parse import quote
 import httpx
@@ -11,8 +11,7 @@ import os
 import uuid
 
 IS_DOCKER = os.getenv("DOCKER_CONTAINER", "0") == "1"
-ANTHROPIC_MODEL_ID = os.getenv("ANTHROPIC_MODEL_ID", "claude-sonnet-4-20250514")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
 
 if IS_DOCKER:
     from utils import get_ssm_parameter, get_aws_info
@@ -159,10 +158,9 @@ def get_root_agent(session_id: str, actor_id: str):
         result = websearch_a2a(query)
         return str(result.message)
 
-    # Create Anthropic model
-    model = AnthropicModel(
-        client_args={"api_key": ANTHROPIC_API_KEY},
-        model_id=ANTHROPIC_MODEL_ID,
+    # Create Bedrock model (uses IAM credentials, no API key needed)
+    model = BedrockModel(
+        model_id=BEDROCK_MODEL_ID,
         max_tokens=4096,
     )
 
