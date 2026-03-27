@@ -57,9 +57,9 @@ async def call_agent(payload: dict, context):
         raise KeyError("'prompt' field is required in payload")
 
     # Strands Agent handles conversation state internally.
-    # Invoke the agent and yield the result.
-    result = await root_agent.invoke_async(query)
-    yield result
+    # Stream events to match the format the frontend expects.
+    async for event in root_agent.stream_async(query):
+        yield event
 
 
 if __name__ == "__main__":
