@@ -1,0 +1,14 @@
+[project]
+name = "host-strands-claude"
+version = "0.1.0"
+description = "Host Agent using Strands Agents SDK with Anthropic Claude on AgentCore Runtime"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "strands-agents[a2a,anthropic]>=1.0.0",
+    "a2a-sdk",
+    "httpx",
+    "boto3",
+    "bedrock-agentcore",
+    "python-dotenv>=1.1.1",
+]

@@ -1,0 +1,6 @@
+strands-agents[a2a,anthropic]>=1.0.0
+a2a-sdk
+httpx
+boto3
+bedrock-agentcore
+python-dotenv>=1.1.1
