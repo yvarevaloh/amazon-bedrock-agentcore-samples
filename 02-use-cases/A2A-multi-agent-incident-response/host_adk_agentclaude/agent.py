@@ -49,18 +49,19 @@ _PROVIDER_SECRET_MAP = {
 
 
 def _get_cognito_m2m_token(secret_name: str) -> str:
-    """Get M2M token directly from Cognito using client credentials."""
-    secret = json.loads(sm_client.get_secret_value(SecretId=secret_name)["SecretString"])
-    auth = base64.b64encode(f'{secret["client_id"]}:{secret["client_secret"]}'.encode()).decode()
-    data = b"grant_type=client_credentials"
-    req = urllib.request.Request(
-        secret["token_endpoint"],
-        data=data,
-        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/x-www-form-urlencoded"},
+    """Get user access token from Cognito using admin auth flow."""
+    cognito = boto3.client("cognito-idp", region_name=region)
+    resp = cognito.admin_initiate_auth(
+        UserPoolId=os.getenv("COGNITO_USER_POOL_ID", "us-west-2_A2ltY1CrJ"),
+        ClientId=os.getenv("COGNITO_CLIENT_ID", "2i3clv3du243vsn97c5n22afv0"),
+        AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={
+            "USERNAME": os.getenv("COGNITO_USERNAME", "heryeimy@amazon.com"),
+            "PASSWORD": os.getenv("COGNITO_PASSWORD", "TempPass2026!"),
+        },
     )
-    resp = urllib.request.urlopen(req)
-    token = json.loads(resp.read())["access_token"]
-    logger.info("Got Cognito M2M token for %s", secret_name)
+    token = resp["AuthenticationResult"]["AccessToken"]
+    logger.info("Got Cognito user token for %s", secret_name)
     return token
 
 
