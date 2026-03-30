@@ -1,14 +1,20 @@
 from a2a.client import ClientConfig, ClientFactory
 from a2a.types import TransportProtocol
-from bedrock_agentcore.identity.auth import requires_access_token
 from strands import Agent, tool
 from strands.agent.a2a_agent import A2AAgent
 from strands.models.bedrock import BedrockModel
 from prompt import SYSTEM_PROMPT
 from urllib.parse import quote
+import base64
+import boto3
 import httpx
+import json
+import logging
 import os
+import urllib.request
 import uuid
+
+logger = logging.getLogger(__name__)
 
 IS_DOCKER = os.getenv("DOCKER_CONTAINER", "0") == "1"
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
@@ -18,6 +24,7 @@ if IS_DOCKER:
 else:
     from host_adk_agentclaude.utils import get_ssm_parameter, get_aws_info
 
+sm_client = boto3.client("secretsmanager")
 
 # AWS and agent configuration
 account_id, region = get_aws_info()
@@ -34,31 +41,45 @@ WEBSEARCH_AGENT_ARN = (
     f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{WEBSEARCH_AGENT_ID}"
 )
 
+# Map provider names to secret ARNs
+_PROVIDER_SECRET_MAP = {
+    MONITOR_PROVIDER_NAME: os.getenv("MONITOR_SECRET_NAME", "cognito/monitoring/client-config"),
+    WEBSEARCH_PROVIDER_NAME: os.getenv("WEBSEARCH_SECRET_NAME", "cognito/websearch/client-config"),
+}
+
+
+def _get_cognito_m2m_token(secret_name: str) -> str:
+    """Get M2M token directly from Cognito using client credentials."""
+    secret = json.loads(sm_client.get_secret_value(SecretId=secret_name)["SecretString"])
+    auth = base64.b64encode(f'{secret["client_id"]}:{secret["client_secret"]}'.encode()).decode()
+    data = b"grant_type=client_credentials"
+    req = urllib.request.Request(
+        secret["token_endpoint"],
+        data=data,
+        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    resp = urllib.request.urlopen(req)
+    token = json.loads(resp.read())["access_token"]
+    logger.info("Got Cognito M2M token for %s", secret_name)
+    return token
+
 
 def _create_client_factory(provider_name: str, session_id: str, actor_id: str):
     """Create a lazy client factory that creates fresh httpx clients on demand."""
+    secret_name = _PROVIDER_SECRET_MAP.get(provider_name, "cognito/monitoring/client-config")
 
     def _get_authenticated_client() -> httpx.AsyncClient:
-        @requires_access_token(
-            provider_name=provider_name,
-            scopes=[],
-            auth_flow="M2M",
-            into="bearer_token",
-            force_authentication=True,
+        bearer_token = _get_cognito_m2m_token(secret_name)
+        headers = {
+            "Authorization": f"Bearer {bearer_token}",
+            "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id,
+            "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Actorid": actor_id,
+        }
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout=300.0),
+            headers=headers,
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
         )
-        def _create_client(bearer_token: str = str()) -> httpx.AsyncClient:
-            headers = {
-                "Authorization": f"Bearer {bearer_token}",
-                "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id,
-                "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Actorid": actor_id,
-            }
-            return httpx.AsyncClient(
-                timeout=httpx.Timeout(timeout=300.0),
-                headers=headers,
-                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
-            )
-
-        return _create_client()
 
     class LazyClientFactory:
         def __init__(self):
