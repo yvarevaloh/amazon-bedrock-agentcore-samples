@@ -14,8 +14,8 @@ Parameters:
   AgentDirectory:
     Type: String
     Description: Agent directory with Dockerfile of agent
-    Default: host_adk_agent
-
+    Default: host_adk_agentclaude
+    
   CognitoStackName:
     Type: String
     Description: Name of the Cognito CloudFormation stack to import values from

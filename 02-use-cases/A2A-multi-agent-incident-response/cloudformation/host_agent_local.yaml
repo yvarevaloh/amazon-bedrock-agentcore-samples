@@ -1,0 +1,536 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Host Agent Runtime - Local build variant (no CodeBuild/GitHub dependency)"
+
+Parameters:
+  ContainerImageUri:
+    Type: String
+    Description: Full ECR image URI (e.g. 123456789.dkr.ecr.us-west-2.amazonaws.com/repo:tag)
+
+  CognitoStackName:
+    Type: String
+    Description: Name of the Cognito CloudFormation stack to import values from
+
+  GoogleModelId:
+    Type: String
+    Description: Google model id
+    Default: 'gemini-2.5-flash'
+
+Resources:
+  AgentCoreRuntimeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AssumeRolePolicy
+            Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*'
+      Policies:
+        - PolicyName: AgentCoreRuntimeExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ECRImageAccess
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource:
+                  - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogStreams
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*'
+              - Sid: ECRTokenAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+              - Effect: Allow
+                Resource: '*'
+                Action: cloudwatch:PutMetricData
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'bedrock-agentcore'
+              - Sid: BedrockModelAccess
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: SSMParameterAccess
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'
+              - Sid: Oauth2Token
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetResourceOauth2Token
+                Resource: '*'
+              - Sid: SecretsManager
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Runtime-Role'
+
+  # ECR Repository for Agent Docker Images
+  AgentECRRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Agent-ECR-Repository'
+
+  # Lambda role for ECR image notification
+  ECRImageNotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ECRAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:DescribeImages
+                  - ecr:ListImages
+                Resource: !GetAtt AgentECRRepository.Arn
+        - PolicyName: BedrockAgentCoreAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListAgentRuntimes
+                  - bedrock-agentcore:ListAgentRuntimeEndpoints
+                  - bedrock-agentcore:ListAgentRuntimeVersions
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:GetAgentRuntimeEndpoint
+                  - bedrock-agentcore:UpdateAgentRuntime
+                  - bedrock-agentcore:UpdateAgentRuntimeEndpoint
+                Resource: '*'
+        - PolicyName: IAMPassRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt AgentCoreRuntimeExecutionRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ECR-Notification-Role'
+
+  # Lambda Function for ECR Image Notification
+  ECRImageNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt ECRImageNotificationLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          AGENT_RUNTIME_ID: !GetAtt AgentRuntime.AgentRuntimeId
+          ECR_REPOSITORY_URI: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AgentECRRepository}'
+          ROLE_ARN: !GetAtt AgentCoreRuntimeExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import sys
+          import subprocess
+
+          subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "boto3", "-t", "/tmp"])
+          sys.path.insert(0, "/tmp")
+
+          import boto3
+          import botocore
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received ECR event: {json.dumps(event)}")
+                  detail = event.get('detail', {})
+                  repository_name = detail.get('repository-name')
+                  image_tag = detail.get('image-tag', 'latest')
+                  action = detail.get('action-type')
+                  result = detail.get('result')
+
+                  if action != 'PUSH' or result != 'SUCCESS':
+                      return {'statusCode': 200, 'body': 'Event skipped'}
+
+                  agent_runtime_id = os.environ['AGENT_RUNTIME_ID']
+                  ecr_repository_uri = os.environ['ECR_REPOSITORY_URI']
+                  role_arn = os.environ['ROLE_ARN']
+
+                  client = boto3.client('bedrock-agentcore-control')
+                  get_response = client.get_agent_runtime(agentRuntimeId=agent_runtime_id)
+                  new_container_uri = f"{ecr_repository_uri}:{image_tag}"
+
+                  update_response = client.update_agent_runtime(
+                      agentRuntimeId=agent_runtime_id,
+                      agentRuntimeArtifact={'containerConfiguration': {'containerUri': new_container_uri}},
+                      roleArn=role_arn,
+                      networkConfiguration=get_response['networkConfiguration'],
+                      protocolConfiguration=get_response['protocolConfiguration'],
+                      requestHeaderConfiguration={"requestHeaderAllowlist": ["X-Amzn-Bedrock-AgentCore-Runtime-Custom-Actorid"]},
+                      authorizerConfiguration=get_response['authorizerConfiguration'],
+                      environmentVariables=get_response['environmentVariables'],
+                  )
+                  logger.info(f"Runtime updated. New version: {update_response['agentRuntimeVersion']}")
+                  return {'statusCode': 200, 'body': json.dumps({'newContainerUri': new_container_uri})}
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}", exc_info=True)
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+
+  ECRImageNotificationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ECRImageNotificationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ECRImageEventRule.Arn
+
+  ECRImageEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Trigger Lambda when new ECR image is pushed'
+      EventPattern:
+        source:
+          - aws.ecr
+        detail-type:
+          - ECR Image Action
+        detail:
+          action-type:
+            - PUSH
+          result:
+            - SUCCESS
+          repository-name:
+            - !Ref AgentECRRepository
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ECRImageNotificationFunction.Arn
+          Id: ECRImageNotificationTarget
+
+  # BedrockAgentCore Runtime using pre-built image
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: !Join ['', !Split ['-', !Sub '${AWS::StackName}']]
+      RoleArn: !GetAtt AgentCoreRuntimeExecutionRole.Arn
+      NetworkConfiguration:
+        NetworkMode: "PUBLIC"
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref ContainerImageUri
+      ProtocolConfiguration: HTTP
+      RequestHeaderConfiguration:
+        RequestHeaderAllowlist:
+          - X-Amzn-Bedrock-AgentCore-Runtime-Custom-Actorid
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl:
+            Fn::ImportValue: !Sub '${CognitoStackName}-DiscoveryUrl'
+          AllowedClients:
+            - Fn::ImportValue: !Sub '${CognitoStackName}-WebUserPoolClientId'
+      EnvironmentVariables:
+        GOOGLE_MODEL_ID: !Ref GoogleModelId
+        GOOGLE_GENAI_USE_VERTEXAI: 0
+        MCP_REGION: !Sub '${AWS::Region}'
+      Tags:
+        Name: !Sub '${AWS::StackName}-Agent-Runtime'
+
+  AgentRuntimeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupClass: STANDARD
+      LogGroupName: !Sub "/aws/vendedlogs/bedrock-agentcore/${AgentRuntime.AgentRuntimeId}"
+
+  AgentRuntimeDeliverSourceApplicationLogs:
+    Type: AWS::Logs::DeliverySource
+    Properties:
+      LogType: APPLICATION_LOGS
+      Name: !Sub "${AgentRuntime.AgentRuntimeId}-logs-source"
+      ResourceArn: !GetAtt AgentRuntime.AgentRuntimeArn
+
+  AgentRuntimeDeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      DeliveryDestinationType: "CWL"
+      DestinationResourceArn: !GetAtt AgentRuntimeLogGroup.Arn
+      Name: !Sub "${AgentRuntime.AgentRuntimeId}-logs-destination"
+
+  AgentRuntimeDeliveryApplicationLogs:
+    Type: AWS::Logs::Delivery
+    DependsOn:
+      - AgentRuntimeDeliverSourceApplicationLogs
+      - AgentRuntimeDeliveryDestination
+    Properties:
+      DeliveryDestinationArn: !GetAtt AgentRuntimeDeliveryDestination.Arn
+      DeliverySourceName: !Sub "${AgentRuntime.AgentRuntimeId}-logs-source"
+
+  # X-Ray Traces Setup
+  XRayTracesSetupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogsDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutDeliverySource
+                  - logs:DeleteDeliverySource
+                  - logs:PutDeliveryDestination
+                  - logs:DeleteDeliveryDestination
+                  - logs:CreateDelivery
+                  - logs:DeleteDelivery
+                  - logs:GetDeliverySource
+                  - logs:GetDeliveryDestination
+                  - logs:GetDelivery
+                  - logs:DescribeDeliveries
+                  - logs:DescribeDeliveryDestinations
+                  - logs:DescribeDeliverySources
+                  - logs:PutSubscriptionFilter
+                  - logs:GetSubscriptionFilter
+                  - logs:DeleteSubscriptionFilter
+                  - logs:PutDeliveryDestinationPolicy
+                  - logs:GetDeliveryDestinationPolicy
+                  - logs:DeleteDeliveryDestinationPolicy
+                Resource: '*'
+        - PolicyName: AgentCoreDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:AllowVendedLogDeliveryForResource
+                Resource: '*'
+        - PolicyName: XRayAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                  - xray:GetSamplingStatisticSummaries
+                  - xray:PutResourcePolicy
+                  - xray:ListResourcePolicies
+                Resource: '*'
+        - PolicyName: IAMPassRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'logs.amazonaws.com'
+
+  XRayTracesSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt XRayTracesSetupLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          RESOURCE_ID: !GetAtt AgentRuntime.AgentRuntimeId
+          RESOURCE_ARN: !GetAtt AgentRuntime.AgentRuntimeArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+          import logging
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  request_type = event['RequestType']
+                  region = os.environ['REGION']
+                  resource_id = os.environ['RESOURCE_ID']
+                  resource_arn = os.environ['RESOURCE_ARN']
+                  logs_client = boto3.client('logs', region_name=region)
+
+                  if request_type == 'Create':
+                      traces_source = logs_client.put_delivery_source(
+                          name=f"{resource_id}-traces-source", logType="TRACES", resourceArn=resource_arn)
+                      traces_dest = logs_client.put_delivery_destination(
+                          name=f"{resource_id}-traces-destination", deliveryDestinationType='XRAY')
+                      traces_delivery = logs_client.create_delivery(
+                          deliverySourceName=traces_source['deliverySource']['name'],
+                          deliveryDestinationArn=traces_dest['deliveryDestination']['arn'])
+                      send_response(event, context, 'SUCCESS', {'DeliveryId': traces_delivery['delivery']['id']})
+
+                  elif request_type == 'Delete':
+                      for action, kwargs in [
+                          ('delete_delivery', {'id': f"{resource_id}-traces-source"}),
+                          ('delete_delivery_destination', {'name': f"{resource_id}-traces-destination"}),
+                          ('delete_delivery_source', {'name': f"{resource_id}-traces-source"}),
+                      ]:
+                          try:
+                              getattr(logs_client, action)(**kwargs)
+                          except Exception as e:
+                              logger.warning(f"Cleanup {action}: {e}")
+                      send_response(event, context, 'SUCCESS', {})
+
+                  elif request_type == 'Update':
+                      send_response(event, context, 'SUCCESS', {})
+
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}", exc_info=True)
+                  send_response(event, context, 'FAILED', {})
+
+          def send_response(event, context, status, data):
+              body = json.dumps({
+                  'Status': status, 'Reason': 'See CloudWatch Logs',
+                  'PhysicalResourceId': 'XRayTracesSetup',
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'], 'Data': data})
+              http = urllib3.PoolManager()
+              http.request('PUT', event['ResponseURL'], body=body,
+                           headers={'content-type': '', 'content-length': str(len(body))})
+
+  XRayTracesSetup:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: AgentRuntime
+    Properties:
+      ServiceToken: !GetAtt XRayTracesSetupFunction.Arn
+
+  AgentRuntimeIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/hostagent/agentcore/runtime-id'
+      Description: 'BedrockAgentCore Runtime ID'
+      Type: String
+      Value: !GetAtt AgentRuntime.AgentRuntimeId
+
+  AgentProviderNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/hostagent/agentcore/provider-name'
+      Description: 'OAuth2 Credential Provider Name'
+      Type: String
+      Value: !Sub 'HostAgentOAuth2Provider-${AWS::StackName}'
+
+Outputs:
+  AgentRuntimeArn:
+    Description: 'ARN of the BedrockAgentCore Runtime'
+    Value: !GetAtt AgentRuntime.AgentRuntimeArn
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentRuntimeArn'
+
+  AgentRuntimeId:
+    Description: 'ID of the BedrockAgentCore Runtime'
+    Value: !GetAtt AgentRuntime.AgentRuntimeId
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentRuntimeId'
+
+  AgentRuntimeName:
+    Description: 'Name of the BedrockAgentCore Runtime'
+    Value: !Ref AgentRuntime
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentRuntimeName'
+
+  AgentProviderName:
+    Description: 'Name of the Agent provider'
+    Value: !Sub 'HostAgentOAuth2Provider-${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentProviderName'
+
+  ECRRepositoryUri:
+    Description: 'ECR Repository URI for future pushes'
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AgentECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepositoryUri'
